@@ -1,0 +1,326 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
+using Microsoft.Kinect;
+using System.IO;
+using Emgu.CV;
+using Emgu.CV.CvEnum;
+using Emgu.CV.Structure;
+using Emgu.CV.UI;
+using Emgu.CV.WPF;
+using System.Drawing;
+
+namespace Kinect_Hand
+{
+
+    /// <summary>
+    /// Interaction logic for MainWindow.xaml
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+
+        private KinectSensor sensor;
+
+        private WriteableBitmap colorBitmap;
+
+        private byte[] colorPixels;
+
+        public Image<Bgr, Byte> imageOriginal;
+
+        Image<Bgr, Byte> imageOriginalcopy;
+
+        int frameWidth;
+
+        int frameHeight;
+
+        Seq<System.Drawing.Point> hull;
+
+        Seq<System.Drawing.Point> filteredHull;
+
+        Seq<MCvConvexityDefect> defects;
+
+        MCvConvexityDefect[] defectArray;
+
+        MCvBox2D box;
+
+        Ellipse ellip;
+
+        Ycc YCrCb_min;
+
+        Ycc YCrCb_max;
+
+        Image<Bgr, byte> image;
+
+        Emgu.CV.KinectCapture capture;
+
+        Capture cap;
+
+        LineSegment2D line;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+
+            YCrCb_min = new Ycc(0, 131, 80);
+
+            YCrCb_max = new Ycc(255, 185, 135);
+
+
+        }
+
+
+
+        private void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            foreach (var potentialSensor in KinectSensor.KinectSensors)
+            {
+                if (potentialSensor.Status == KinectStatus.Connected)
+                {
+                    this.sensor = potentialSensor;
+                    break;
+                }
+            }
+
+            if (null != this.sensor)
+            {
+
+                this.sensor.ColorStream.Enable(ColorImageFormat.RgbResolution640x480Fps30);
+
+
+                this.colorPixels = new byte[this.sensor.ColorStream.FramePixelDataLength];
+
+
+                this.colorBitmap = new WriteableBitmap(this.sensor.ColorStream.FrameWidth, this.sensor.ColorStream.FrameHeight, 96.0, 96.0, PixelFormats.Bgr32, null);
+
+
+                // this.Image.Source = this.colorBitmap;
+
+
+                this.sensor.ColorFrameReady += this.SensorColorFrameReady;
+
+
+                try
+                {
+                    this.sensor.Start();
+                }
+                catch (IOException)
+                {
+                    this.sensor = null;
+                }
+
+
+                if (null == this.sensor)
+                {
+                    MessageBox.Show("Kinect Not Found!");
+                }
+
+
+
+            }
+        }
+
+        private void SensorColorFrameReady(object sender, ColorImageFrameReadyEventArgs e)
+        {
+            System.Drawing.Bitmap myBmp;
+
+            using (ColorImageFrame colorFrame = e.OpenColorImageFrame())
+            {
+                if (colorFrame != null)
+                {
+                    colorFrame.CopyPixelDataTo(this.colorPixels);
+
+
+                    this.colorBitmap.WritePixels(
+                    new Int32Rect(0, 0, this.colorBitmap.PixelWidth, this.colorBitmap.PixelHeight),
+                    this.colorPixels,
+                    this.colorBitmap.PixelWidth * sizeof(int),
+                    0);
+                }
+            }
+
+
+
+            if (null == this.sensor)
+            {
+                MessageBox.Show("Please connect a Kinect & try again");
+            }
+
+
+            BitmapEncoder enc = new BmpBitmapEncoder();
+
+            enc.Frames.Add(BitmapFrame.Create(this.colorBitmap));
+
+            MemoryStream ms = new MemoryStream();
+
+            enc.Save(ms);
+
+            myBmp = new System.Drawing.Bitmap(ms);
+
+            imageOriginal = new Image<Bgr, byte>(myBmp);
+
+            Image<Gray, byte> skin = DetectSkin(imageOriginal, YCrCb_min, YCrCb_max);
+
+            imageOriginalcopy = imageOriginal.Copy();
+
+            ExtractContourAndHull(skin);
+
+            Image.Source = this.colorBitmap;
+
+            DrawAndComputeFingersNum();
+
+            Contour.Source = BitmapSourceConvert.ToBitmapSource(imageOriginalcopy);
+
+        }
+
+        public Image<Gray, byte> DetectSkin(Image<Bgr, byte> Img, IColor min, IColor max)
+        {
+            Image<Ycc, Byte> currentYCrCbFrame = Img.Convert<Ycc, Byte>();
+            Image<Gray, byte> skin = new Image<Gray, byte>(Img.Width, Img.Height);
+            skin = currentYCrCbFrame.InRange((Ycc)min, (Ycc)max);
+            StructuringElementEx rect_12 = new StructuringElementEx(12, 12, 6, 6, Emgu.CV.CvEnum.CV_ELEMENT_SHAPE.CV_SHAPE_RECT);
+            CvInvoke.cvErode(skin, skin, rect_12, 1);
+            StructuringElementEx rect_6 = new StructuringElementEx(6, 6, 3, 3, Emgu.CV.CvEnum.CV_ELEMENT_SHAPE.CV_SHAPE_RECT);
+            CvInvoke.cvDilate(skin, skin, rect_6, 2);
+            return skin;
+        }
+
+        public void ExtractContourAndHull(Image<Gray, byte> skin)
+        {
+            try
+            {
+                using (MemStorage storage = new MemStorage())
+                {
+
+                    Contour<System.Drawing.Point> contours = skin.FindContours(Emgu.CV.CvEnum.CHAIN_APPROX_METHOD.CV_CHAIN_APPROX_SIMPLE, Emgu.CV.CvEnum.RETR_TYPE.CV_RETR_LIST);
+                    Contour<System.Drawing.Point> biggestContour = null;
+
+
+                    // To find the biggest contour
+                    Double Result1 = 0;
+                    Double Result2 = 0;
+                    while (contours != null)
+                    {
+                        Result1 = contours.Area;
+                        if (Result1 > Result2)
+                        {
+                            Result2 = Result1;
+                            biggestContour = contours;
+                        }
+                        contours = contours.HNext;
+                    }
+
+
+
+
+                    if (biggestContour != null)
+                    {
+
+                        Contour<System.Drawing.Point> currentContour = biggestContour.ApproxPoly(biggestContour.Perimeter * 0.0025, storage);
+                        imageOriginalcopy.Draw(currentContour, new Bgr(System.Drawing.Color.Green), 2);
+                        biggestContour = currentContour;
+
+                        hull = biggestContour.GetConvexHull(Emgu.CV.CvEnum.ORIENTATION.CV_CLOCKWISE);
+                        box = biggestContour.GetMinAreaRect();
+                        PointF[] points = box.GetVertices();
+
+                        System.Drawing.Point[] ps = new System.Drawing.Point[points.Length];
+                        for (int i = 0; i < points.Length; i++)
+                            ps[i] = new System.Drawing.Point((int)points[i].X, (int)points[i].Y);
+
+                      
+                      
+                            imageOriginalcopy.DrawPolyline(hull.ToArray(), true, new Bgr(200, 125, 75), 2);
+                            imageOriginalcopy.Draw(new CircleF(new PointF(box.center.X, box.center.Y), 3), new Bgr(200, 125, 75), 2);
+                                          
+
+                        filteredHull = new Seq<System.Drawing.Point>(storage);
+                        for (int i = 0; i < hull.Total; i++)
+                        {
+                            if (Math.Sqrt(Math.Pow(hull[i].X - hull[i + 1].X, 2) + Math.Pow(hull[i].Y - hull[i + 1].Y, 2)) > box.size.Width / 10)
+                            {
+                                filteredHull.Push(hull[i]);
+                            }
+                        }
+
+                        defects = biggestContour.GetConvexityDefacts(storage, Emgu.CV.CvEnum.ORIENTATION.CV_CLOCKWISE);
+
+                        defectArray = defects.ToArray();
+
+
+
+                    }
+
+                }
+
+            }
+            catch (Exception)
+            {
+                Console.WriteLine("Null in Hull");
+            }
+        }
+
+
+
+        private void DrawAndComputeFingersNum()
+        {
+            int fingerNum = 0;
+
+
+            #region defects drawing
+
+            if (defects != null)
+            {
+                for (int i = 0; i < defects.Total; i++)
+                {
+                    PointF startPoint = new PointF((float)defectArray[i].StartPoint.X,
+                                                    (float)defectArray[i].StartPoint.Y);
+
+                    PointF depthPoint = new PointF((float)defectArray[i].DepthPoint.X,
+                                                    (float)defectArray[i].DepthPoint.Y);
+
+                    PointF endPoint = new PointF((float)defectArray[i].EndPoint.X,
+                                                    (float)defectArray[i].EndPoint.Y);
+
+                    LineSegment2D startDepthLine = new LineSegment2D(defectArray[i].StartPoint, defectArray[i].DepthPoint);
+
+                    LineSegment2D depthEndLine = new LineSegment2D(defectArray[i].DepthPoint, defectArray[i].EndPoint);
+
+                    CircleF startCircle = new CircleF(startPoint, 5f);
+
+                    CircleF depthCircle = new CircleF(depthPoint, 5f);
+
+                    CircleF endCircle = new CircleF(endPoint, 5f);
+
+
+                    if ((startCircle.Center.Y < box.center.Y || depthCircle.Center.Y < box.center.Y) && (startCircle.Center.Y < depthCircle.Center.Y) && (Math.Sqrt(Math.Pow(startCircle.Center.X - depthCircle.Center.X, 2) + Math.Pow(startCircle.Center.Y - depthCircle.Center.Y, 2)) > box.size.Height / 6.5))
+                    {
+                        fingerNum++;
+                        Num.Content = fingerNum.ToString();
+                        imageOriginalcopy.Draw(startDepthLine, new Bgr(System.Drawing.Color.Green), 2);
+
+                    }
+
+
+                    imageOriginalcopy.Draw(startCircle, new Bgr(System.Drawing.Color.Red), 2);
+                    imageOriginalcopy.Draw(depthCircle, new Bgr(System.Drawing.Color.Yellow), 5);
+
+                }
+            #endregion
+
+                MCvFont font = new MCvFont(Emgu.CV.CvEnum.FONT.CV_FONT_HERSHEY_DUPLEX, 5d, 5d);
+                imageOriginalcopy.Draw(fingerNum.ToString(), ref font, new System.Drawing.Point(50, 150), new Bgr(System.Drawing.Color.White));              
+            }
+
+        }
+    }
+}
